@@ -1,0 +1,5 @@
+datos_climatologicos_diarios
+descargas_*
+__pycache__
+.env
+
