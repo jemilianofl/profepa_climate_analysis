@@ -2,10 +2,9 @@ name: Actualizar Base de Datos Climática
 
 on:
   schedule:
-    # Se ejecuta todos los lunes a las 00:00 UTC (Domingo 6PM o 7PM México)
     - cron: '0 0 * * 1'
-  workflow_dispatch: 
-    # Permite ejecutarlo manualmente desde la pestaña "Actions" en GitHub
+  workflow_dispatch:
+    
 
 jobs:
   etl-job:
