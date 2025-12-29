@@ -1,0 +1,16 @@
+streamlit
+pandas
+plotly
+altair
+scipy
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pmdarima
+statsmodels
+folium
+streamlit-folium
+pyarrow
+matplotlib
+openpyxl
+tqdm
