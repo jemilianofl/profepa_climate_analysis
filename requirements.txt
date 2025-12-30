@@ -14,3 +14,4 @@ pyarrow
 matplotlib
 openpyxl
 tqdm
+pg8000

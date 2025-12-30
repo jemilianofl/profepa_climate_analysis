@@ -5,45 +5,49 @@ import os
 from dotenv import load_dotenv
 import socket
 
-# --- 1. PARCHE PARA STREAMLIT CLOUD (FORZAR IPv4) ---
-# Sin esto, Streamlit Cloud falla al conectar con Supabase en muchos casos.
+# --- PARCHE IPv4 (Vital para pg8000 en Streamlit Cloud) ---
 old_getaddrinfo = socket.getaddrinfo
 def new_getaddrinfo(*args, **kwargs):
     res = old_getaddrinfo(*args, **kwargs)
     return [r for r in res if r[0] == socket.AF_INET]
 socket.getaddrinfo = new_getaddrinfo
-# ----------------------------------------------------
+# ----------------------------------------------------------
 
-# Cargar variables de entorno (para local)
 load_dotenv()
 
 @st.cache_resource
 def get_engine():
-    """
-    Crea la conexión a la base de datos una sola vez (Singleton).
-    Maneja credenciales tanto locales (.env) como de Streamlit Cloud (secrets).
-    """
-    # 1. Intentar leer de variable de entorno (Local)
+    # 1. Obtener la URI
     db_uri = os.getenv("DB_CONNECTION_STRING")
-
-    # 2. Si no existe, intentar leer de Streamlit Secrets (Nube)
     if not db_uri:
         try:
             db_uri = st.secrets["DB_CONNECTION_STRING"]
-        except (FileNotFoundError, KeyError):
+        except:
             pass
-
-    # 3. Si sigue vacía, error
+            
     if not db_uri:
-        st.error("❌ Error de Configuración: No se encontró la variable 'DB_CONNECTION_STRING'. Revisa tus Secrets o tu archivo .env")
+        st.error("❌ Error: No se encontró la cadena de conexión.")
         return None
 
-    # 4. Crear el motor con 'pool_pre_ping' para evitar desconexiones
-    return create_engine(db_uri, pool_pre_ping=True)
+    # 2. Intentar crear el motor
+    try:
+        # Creamos el engine
+        engine = create_engine(db_uri, pool_pre_ping=True)
+        
+        # 3. PRUEBA DE CONEXIÓN INMEDIATA
+        # Esto forzará el error aquí mismo si no conecta
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            
+        return engine
+        
+    except Exception as e:
+        # ESTO TE MOSTRARÁ EL ERROR REAL EN PANTALLA
+        st.error(f"❌ Error Fatal de Conexión: {e}")
+        return None
 
-@st.cache_data(ttl=3600)  # Guarda en caché por 1 hora
+@st.cache_data(ttl=3600)
 def cargar_estaciones():
-    """Descarga el catálogo de estaciones."""
     engine = get_engine()
     if not engine: return pd.DataFrame()
     
@@ -53,7 +57,7 @@ def cargar_estaciones():
             df = pd.read_sql(query, conn)
         return df
     except Exception as e:
-        st.error(f"Error cargando estaciones: {e}")
+        st.error(f"Error en la consulta SQL: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
