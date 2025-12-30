@@ -1,3 +1,19 @@
+import socket
+import os
+
+# --- PARCHE OBLIGATORIO PARA STREAMLIT CLOUD (IPv4) ---
+# Debe ir AL PRINCIPIO ABSOLUTO del archivo principal.
+# Esto engaña al sistema para que use solo direcciones IPv4 (compatibles con Supabase).
+try:
+    old_getaddrinfo = socket.getaddrinfo
+    def new_getaddrinfo(*args, **kwargs):
+        res = old_getaddrinfo(*args, **kwargs)
+        return [r for r in res if r[0] == socket.AF_INET]
+    socket.getaddrinfo = new_getaddrinfo
+except Exception as e:
+    print(f"Advertencia al parchar IPv4: {e}")
+# ------------------------------------------------------
+
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
