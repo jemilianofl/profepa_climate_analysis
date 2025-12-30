@@ -3,25 +3,43 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 import os
 from dotenv import load_dotenv
+import socket
 
-# Cargar variables de entorno
+# --- 1. PARCHE PARA STREAMLIT CLOUD (FORZAR IPv4) ---
+# Sin esto, Streamlit Cloud falla al conectar con Supabase en muchos casos.
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    res = old_getaddrinfo(*args, **kwargs)
+    return [r for r in res if r[0] == socket.AF_INET]
+socket.getaddrinfo = new_getaddrinfo
+# ----------------------------------------------------
+
+# Cargar variables de entorno (para local)
 load_dotenv()
-DB_URI = os.getenv("DB_CONNECTION_STRING")
-
-# Fallback para Streamlit Cloud
-if not DB_URI:
-    try:
-        DB_URI = st.secrets["DB_CONNECTION_STRING"]
-    except:
-        pass
 
 @st.cache_resource
 def get_engine():
-    """Crea la conexión a la base de datos una sola vez (Singleton)."""
-    if not DB_URI:
-        st.error("❌ Falta la cadena de conexión.")
+    """
+    Crea la conexión a la base de datos una sola vez (Singleton).
+    Maneja credenciales tanto locales (.env) como de Streamlit Cloud (secrets).
+    """
+    # 1. Intentar leer de variable de entorno (Local)
+    db_uri = os.getenv("DB_CONNECTION_STRING")
+
+    # 2. Si no existe, intentar leer de Streamlit Secrets (Nube)
+    if not db_uri:
+        try:
+            db_uri = st.secrets["DB_CONNECTION_STRING"]
+        except (FileNotFoundError, KeyError):
+            pass
+
+    # 3. Si sigue vacía, error
+    if not db_uri:
+        st.error("❌ Error de Configuración: No se encontró la variable 'DB_CONNECTION_STRING'. Revisa tus Secrets o tu archivo .env")
         return None
-    return create_engine(DB_URI)
+
+    # 4. Crear el motor con 'pool_pre_ping' para evitar desconexiones
+    return create_engine(db_uri, pool_pre_ping=True)
 
 @st.cache_data(ttl=3600)  # Guarda en caché por 1 hora
 def cargar_estaciones():
@@ -44,9 +62,12 @@ def cargar_lecturas_por_estado(estado):
     engine = get_engine()
     if not engine: return pd.DataFrame()
 
+    # Nota: Asegúrate de que el JOIN sea correcto.
+    # En tu ETL, la Primary Key de estaciones es "ESTACION", no "NOMBRE".
+    # Lo cambié abajo para que sea más robusto (e."ESTACION"), pero si usas "NOMBRE" está bien.
     query = text("""
         SELECT l.* FROM lecturas l
-        JOIN estaciones e ON l."ESTACION" = e."NOMBRE"
+        JOIN estaciones e ON l."ESTACION" = e."ESTACION"
         WHERE e."ESTADO" = :estado
     """)
     
