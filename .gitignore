@@ -1,4 +1,5 @@
-datos_climatologicos_diarios
+datos_climatologicos_diarios/
+!datos_peninsula.zip
 descargas_*
 __pycache__
 .env
