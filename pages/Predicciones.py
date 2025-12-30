@@ -1,99 +1,210 @@
 import streamlit as st
 import pandas as pd
-import altair as alt
-import sys
-import os
-from statsmodels.tsa.seasonal import seasonal_decompose
-import pmdarima as pm
 import numpy as np
+import plotly.graph_objects as go
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import utils 
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import utils
+# --- CONFIGURACIÓN DE PÁGINA ---
+# Si Predicciones.py se ejecuta directo, configura la página. 
+# Si es importado por un main, esto se ignora o se puede comentar.
+# st.set_page_config(page_title="Predicciones Climáticas", layout="wide")
 
-st.set_page_config(page_title="Predicciones", page_icon="🔮", layout="wide")
-st.title("🔮 Modelado Estocástico y Dinámica del Cambio")
-
-# Carga
-df_estaciones = utils.cargar_estaciones()
-if df_estaciones.empty: st.stop()
-
-c1, c2 = st.columns(2)
-with c1: estado = st.selectbox("Estado:", sorted(df_estaciones['ESTADO'].unique()))
-with c2: variable = st.selectbox("Variable:", ["TMAX", "TMIN", "PRECIP"])
-
-with st.spinner("Cargando historia..."):
-    df = utils.cargar_lecturas_por_estado(estado)
-if df.empty: st.stop()
-
-# Procesamiento
-df['FECHA'] = pd.to_datetime(df['FECHA'])
-df[variable] = pd.to_numeric(df[variable], errors='coerce')
-agg = 'sum' if variable == 'PRECIP' else 'mean'
-df_m = df.set_index('FECHA').resample('MS')[variable].agg(agg)
-df_m = df_m.reindex(pd.date_range(df_m.index.min(), df_m.index.max(), freq='MS')).interpolate()
-df_m = df_m.reset_index()
-df_m.columns = ['FECHA', variable]
-
-tab1, tab2 = st.tabs(["📉 Cinemática", "⚙️ Predicción SARIMA"])
-
-with tab1:
-    st.subheader("Velocidad de Cambio (Derivada)")
+def generar_modelo_robusto(serie, periodos=12, variable="TMAX"):
+    """
+    Intenta generar una predicción usando SARIMA. 
+    Si falla por problemas matemáticos (convergencia), usa Holt-Winters.
+    """
+    # 1. Definir modelo SARIMA (Seasonal ARIMA)
+    # Usamos parámetros genéricos robustos para clima estacional
     try:
-        decomp = seasonal_decompose(df_m.set_index('FECHA')[variable], period=12)
-        trend = decomp.trend
-        derivada = np.gradient(trend.dropna()) * 12 # Anualizado
+        model = SARIMAX(serie, 
+                        order=(1, 1, 1), 
+                        seasonal_order=(1, 1, 0, 12),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False)
         
-        kinematics = pd.DataFrame({
-            'Fecha': df_m['FECHA'].iloc[6:-6],
-            'Tendencia': trend.dropna().values,
-            'Velocidad': derivada
-        })
+        # Aumentamos maxiter para evitar el warning de "Maximum Likelihood optimization failed"
+        results = model.fit(disp=False, maxiter=500)
         
-        c_trend = alt.Chart(kinematics).mark_line(color='#333').encode(
-            x='Fecha:T', y=alt.Y('Tendencia:Q', scale=alt.Scale(zero=False))
-        ).properties(title="Tendencia", height=200)
+        forecast = results.get_forecast(steps=periodos)
+        prediccion = forecast.predicted_mean
+        conf_int = forecast.conf_int()
         
-        c_vel = alt.Chart(kinematics).mark_bar().encode(
-            x='Fecha:T', y='Velocidad:Q',
-            color=alt.condition(alt.datum.Velocidad > 0, alt.value("red"), alt.value("blue"))
-        ).properties(title="Velocidad (Unidades/Año)", height=200)
+        # Renombrar columnas de intervalo de confianza para estandarizar
+        conf_int.columns = ["lower", "upper"]
         
-        st.altair_chart(c_trend & c_vel, theme="streamlit", use_container_width=True)
-        
-    except: st.warning("Datos insuficientes para cinemática.")
+        return prediccion, conf_int, "SARIMA (Estadístico Avanzado)"
 
-with tab2:
-    st.subheader("Predicción (Caja Blanca)")
-    if len(df_m) > 36 and st.button("🚀 Calcular"):
-        with st.spinner("Optimizando modelo..."):
-            try:
-                model = pm.auto_arima(df_m[variable], seasonal=True, m=12, suppress_warnings=True)
-                pred, conf = model.predict(n_periods=24, return_conf_int=True)
-                
-                fechas_fut = pd.date_range(df_m['FECHA'].iloc[-1], periods=25, freq='MS')[1:]
-                df_fut = pd.DataFrame({'FECHA': fechas_fut, 'PRED': pred.values, 'LOWER': conf[:,0], 'UPPER': conf[:,1]})
-                
-                # Explicación
-                p,d,q = model.order
-                P,D,Q,m = model.seasonal_order
-                st.info(f"Modelo seleccionado: SARIMA({p},{d},{q})x({P},{D},{Q})12. AIC: {model.aic():.1f}")
-                
-                # Gráfica
-                base = alt.Chart(df_m.tail(96)).mark_line(color='gray').encode(x='FECHA:T', y=alt.Y(variable, scale=alt.Scale(zero=False)))
-                line = alt.Chart(df_fut).mark_line(color='red', strokeDash=[5,5]).encode(x='FECHA:T', y='PRED')
-                band = alt.Chart(df_fut).mark_area(opacity=0.2, color='red').encode(x='FECHA:T', y='LOWER', y2='UPPER')
-                st.altair_chart(base + band + line, theme="streamlit", use_container_width=True)
-                
-                # Diagnóstico
-                res = pd.DataFrame({'Residuos': model.resid()}).reset_index()
-                h = alt.Chart(res).mark_bar().encode(x=alt.X('Residuos', bin=True), y='count()').properties(height=200)
-                l = alt.Chart(res).mark_line().encode(x='index', y='Residuos').properties(height=200)
-                st.altair_chart(h | l, theme="streamlit", use_container_width=True)
-                
-                # Tabla Segura
-                with st.expander("Ver Datos"):
-                    df_show = df_fut.copy()
-                    df_show['FECHA'] = df_show['FECHA'].dt.strftime('%Y-%m-%d')
-                    st.dataframe(df_show.style.format("{:.2f}"), use_container_width=True)
-                    
-            except Exception as e: st.error(f"Error: {e}")
+    except Exception as e:
+        # 2. PLAN B: Holt-Winters (Suavizado Exponencial)
+        # Es mucho más rápido y rara vez falla. Ideal como fallback.
+        try:
+            # Trend='add' y Seasonal='add' suele funcionar bien para temperatura
+            # Para precipitación a veces 'mul' (multiplicativo) es mejor, pero 'add' es más seguro.
+            hw_model = ExponentialSmoothing(serie, 
+                                            trend='add', 
+                                            seasonal='add', 
+                                            seasonal_periods=12).fit()
+            prediccion = hw_model.forecast(periodos)
+            
+            # Holt-Winters no da intervalos de confianza nativos fácilmente,
+            # generamos uno aproximado basado en la desviación estándar histórica.
+            std_dev = serie.std()
+            conf_int = pd.DataFrame({
+                "lower": prediccion - 1.96 * std_dev,
+                "upper": prediccion + 1.96 * std_dev
+            }, index=prediccion.index)
+            
+            return prediccion, conf_int, "Holt-Winters (Suavizado Exponencial)"
+            
+        except Exception as e2:
+            return None, None, f"Error: {str(e2)}"
+
+def app():
+    st.title("🔮 Predicciones Climáticas con IA")
+    st.markdown("""
+    Este módulo utiliza modelos estadísticos (**SARIMA** y **Holt-Winters**) para proyectar 
+    el comportamiento futuro del clima basándose en datos históricos.
+    """)
+
+    # --- 1. CARGA DE DATOS ---
+    with st.spinner("Cargando catálogo de estaciones..."):
+        df_estaciones = utils.cargar_estaciones()
+
+    if df_estaciones.empty:
+        st.error("No hay conexión con la base de datos.")
+        return
+
+    # --- 2. CONTROLES ---
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        lista_estados = sorted(df_estaciones['ESTADO'].unique())
+        estado_sel = st.selectbox("1. Estado", lista_estados)
+
+    with col2:
+        # Filtrar estaciones por estado
+        estaciones_estado = df_estaciones[df_estaciones['ESTADO'] == estado_sel]
+        mapa_nombres = dict(zip(estaciones_estado['NOMBRE'], estaciones_estado['ESTACION']))
+        nombre_sel = st.selectbox("2. Estación", estaciones_estado['NOMBRE'].unique())
+        id_estacion = mapa_nombres[nombre_sel]
+
+    with col3:
+        var_opciones = {
+            "Temperatura Máxima (°C)": "TMAX",
+            "Temperatura Mínima (°C)": "TMIN",
+            "Precipitación (mm)": "PRECIP",
+            "Evaporación (mm)": "EVAP"
+        }
+        variable_sel = st.selectbox("3. Variable", list(var_opciones.keys()))
+        col_db = var_opciones[variable_sel]
+
+    with col4:
+        meses_pred = st.slider("4. Meses a predecir", 6, 24, 12)
+
+    # --- 3. PROCESAMIENTO ---
+    if st.button("🚀 Generar Pronóstico", type="primary"):
+        # Cargar lecturas
+        df_lecturas = utils.cargar_lecturas_por_estado(estado_sel)
+        
+        if df_lecturas.empty:
+            st.warning("No se encontraron lecturas para este estado.")
+            return
+
+        # Filtrar por estación específica
+        df_filtrado = df_lecturas[df_lecturas["ESTACION"] == id_estacion].copy()
+        
+        if df_filtrado.empty:
+            st.warning(f"La estación {nombre_sel} no tiene datos históricos registrados.")
+            return
+
+        # Preparación de Series de Tiempo
+        df_filtrado['FECHA'] = pd.to_datetime(df_filtrado['FECHA'])
+        df_filtrado = df_filtrado.set_index('FECHA').sort_index()
+        
+        # Seleccionar columna y limpiar nulos
+        serie_diaria = pd.to_numeric(df_filtrado[col_db], errors='coerce').dropna()
+
+        if len(serie_diaria) < 365:
+            st.error("⚠️ Datos insuficientes: Se necesitan al menos 1 año de registros para predecir.")
+            return
+
+        # --- RESAMPLING (CLAVE PARA CONVERGENCIA) ---
+        # Convertimos datos diarios a mensuales.
+        # Temperatura -> Promedio (mean)
+        # Lluvia/Evap -> Suma (sum)
+        regla_resample = 'MS' # Month Start
+        if col_db in ["PRECIP", "EVAP"]:
+            serie_mensual = serie_diaria.resample(regla_resample).sum()
+        else:
+            serie_mensual = serie_diaria.resample(regla_resample).mean()
+
+        # Rellenar huecos mensuales si existen (interpolación lineal)
+        serie_mensual = serie_mensual.interpolate(method='linear')
+
+        # --- 4. MODELADO ---
+        with st.spinner(f"Entrenando modelos para {nombre_sel}..."):
+            pred, conf, nombre_modelo = generar_modelo_robusto(serie_mensual, periodos=meses_pred, variable=col_db)
+
+        if pred is None:
+            st.error(f"No se pudo generar el modelo. Razón: {nombre_modelo}")
+        else:
+            st.success(f"✅ Predicción generada exitosamente usando: **{nombre_modelo}**")
+
+            # --- 5. VISUALIZACIÓN ---
+            fig = go.Figure()
+
+            # Datos Históricos (Últimos 5 años para no saturar)
+            historia_visible = serie_mensual.tail(60) 
+            
+            fig.add_trace(go.Scatter(
+                x=historia_visible.index, 
+                y=historia_visible.values,
+                mode='lines',
+                name='Histórico (Mensual)',
+                line=dict(color='gray', width=1.5)
+            ))
+
+            # Predicción
+            fig.add_trace(go.Scatter(
+                x=pred.index, 
+                y=pred.values,
+                mode='lines+markers',
+                name='Pronóstico',
+                line=dict(color='#E63946', width=2.5)
+            ))
+
+            # Intervalo de Confianza (Sombra)
+            fig.add_trace(go.Scatter(
+                x=pd.concat([pd.Series(conf.index), pd.Series(conf.index[::-1])]),
+                y=pd.concat([conf['upper'], conf['lower'][::-1]]),
+                fill='toself',
+                fillcolor='rgba(230, 57, 70, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                hoverinfo="skip",
+                name='Intervalo de Confianza (95%)'
+            ))
+
+            fig.update_layout(
+                title=f"Proyección de {variable_sel} - {nombre_sel}",
+                xaxis_title="Fecha",
+                yaxis_title=variable_sel,
+                template="plotly_white",
+                hovermode="x unified",
+                legend=dict(orientation="h", y=1.1)
+            )
+
+            # Usamos el parámetro nuevo para evitar warnings
+            st.plotly_chart(fig, width="stretch")
+
+            # --- 6. METRICAS ---
+            ultimo_valor = historia_visible.iloc[-1]
+            valor_predicho_final = pred.iloc[-1]
+            delta = valor_predicho_final - ultimo_valor
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Último Dato Registrado", f"{ultimo_valor:.1f}")
+            m2.metric(f"Proyección a {meses_pred} meses", f"{valor_predicho_final:.1f}", f"{delta:.1f}")
+            m3.metric("Tendencia Detectada", "📈 Alza" if delta > 0 else "📉 Baja")

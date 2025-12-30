@@ -2,48 +2,51 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 import os
-from dotenv import load_dotenv
 import socket
 
 # --- PARCHE IPv4 (Vital para pg8000 en Streamlit Cloud) ---
-old_getaddrinfo = socket.getaddrinfo
-def new_getaddrinfo(*args, **kwargs):
-    res = old_getaddrinfo(*args, **kwargs)
-    return [r for r in res if r[0] == socket.AF_INET]
-socket.getaddrinfo = new_getaddrinfo
+try:
+    old_getaddrinfo = socket.getaddrinfo
+    def new_getaddrinfo(*args, **kwargs):
+        res = old_getaddrinfo(*args, **kwargs)
+        return [r for r in res if r[0] == socket.AF_INET]
+    socket.getaddrinfo = new_getaddrinfo
+except Exception:
+    pass
 # ----------------------------------------------------------
-
-load_dotenv()
 
 @st.cache_resource
 def get_engine():
-    # 1. Obtener la URI
-    db_uri = os.getenv("DB_CONNECTION_STRING")
-    if not db_uri:
+    """
+    Crea la conexión a la base de datos usando pg8000.
+    """
+    # 1. Obtener la URI (Prioridad: Secrets > Environment)
+    try:
+        db_uri = st.secrets["DB_CONNECTION_STRING"]
+    except:
         try:
-            db_uri = st.secrets["DB_CONNECTION_STRING"]
+            from dotenv import load_dotenv
+            load_dotenv()
+            db_uri = os.getenv("DB_CONNECTION_STRING")
         except:
-            pass
-            
+            db_uri = None
+
     if not db_uri:
-        st.error("❌ Error: No se encontró la cadena de conexión.")
+        st.error("❌ Error: No se encontró 'DB_CONNECTION_STRING'.")
         return None
 
-    # 2. Intentar crear el motor
+    # 2. FORZAR DRIVER pg8000 (El truco mágico)
+    # Si la cadena viene como 'postgresql://', la cambiamos a 'postgresql+pg8000://'
+    # Esto asegura que Streamlit Cloud no use drivers binarios rotos.
+    if db_uri.startswith("postgresql://"):
+        db_uri = db_uri.replace("postgresql://", "postgresql+pg8000://", 1)
+
+    # 3. Crear motor
     try:
-        # Creamos el engine
         engine = create_engine(db_uri, pool_pre_ping=True)
-        
-        # 3. PRUEBA DE CONEXIÓN INMEDIATA
-        # Esto forzará el error aquí mismo si no conecta
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-            
         return engine
-        
     except Exception as e:
-        # ESTO TE MOSTRARÁ EL ERROR REAL EN PANTALLA
-        st.error(f"❌ Error Fatal de Conexión: {e}")
+        st.error(f"❌ Error creando el motor de base de datos: {e}")
         return None
 
 @st.cache_data(ttl=3600)
@@ -57,33 +60,23 @@ def cargar_estaciones():
             df = pd.read_sql(query, conn)
         return df
     except Exception as e:
-        st.error(f"Error en la consulta SQL: {e}")
+        st.error(f"Error cargando estaciones: {e}")
         return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def cargar_lecturas_por_estado(estado):
-    """Descarga lecturas filtradas por estado."""
     engine = get_engine()
     if not engine: return pd.DataFrame()
 
-    # Nota: Asegúrate de que el JOIN sea correcto.
-    # En tu ETL, la Primary Key de estaciones es "ESTACION", no "NOMBRE".
-    # Lo cambié abajo para que sea más robusto (e."ESTACION"), pero si usas "NOMBRE" está bien.
-    query = text("""
-        SELECT l.* FROM lecturas l
-        JOIN estaciones e ON l."ESTACION" = e."ESTACION"
-        WHERE e."ESTADO" = :estado
-    """)
-    
     try:
+        query = text("""
+            SELECT l.* FROM lecturas l
+            JOIN estaciones e ON l."ESTACION" = e."ESTACION"
+            WHERE e."ESTADO" = :estado
+        """)
         with engine.connect() as conn:
             df = pd.read_sql(query, conn, params={"estado": estado})
         return df
     except Exception as e:
         st.error(f"Error cargando lecturas: {e}")
         return pd.DataFrame()
-
-def cargar_datos_procesados():
-    """Función helper para cargar todo de golpe (opcional)."""
-    estaciones = cargar_estaciones()
-    return estaciones, None
