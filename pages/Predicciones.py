@@ -7,8 +7,6 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import utils 
 
 # --- CONFIGURACIÓN DE PÁGINA ---
-# Si Predicciones.py se ejecuta directo, configura la página. 
-# Si es importado por un main, esto se ignora o se puede comentar.
 # st.set_page_config(page_title="Predicciones Climáticas", layout="wide")
 
 def generar_modelo_robusto(serie, periodos=12, variable="TMAX"):
@@ -17,7 +15,6 @@ def generar_modelo_robusto(serie, periodos=12, variable="TMAX"):
     Si falla por problemas matemáticos (convergencia), usa Holt-Winters.
     """
     # 1. Definir modelo SARIMA (Seasonal ARIMA)
-    # Usamos parámetros genéricos robustos para clima estacional
     try:
         model = SARIMAX(serie, 
                         order=(1, 1, 1), 
@@ -25,32 +22,24 @@ def generar_modelo_robusto(serie, periodos=12, variable="TMAX"):
                         enforce_stationarity=False,
                         enforce_invertibility=False)
         
-        # Aumentamos maxiter para evitar el warning de "Maximum Likelihood optimization failed"
         results = model.fit(disp=False, maxiter=500)
         
         forecast = results.get_forecast(steps=periodos)
         prediccion = forecast.predicted_mean
         conf_int = forecast.conf_int()
-        
-        # Renombrar columnas de intervalo de confianza para estandarizar
         conf_int.columns = ["lower", "upper"]
         
         return prediccion, conf_int, "SARIMA (Estadístico Avanzado)"
 
     except Exception as e:
         # 2. PLAN B: Holt-Winters (Suavizado Exponencial)
-        # Es mucho más rápido y rara vez falla. Ideal como fallback.
         try:
-            # Trend='add' y Seasonal='add' suele funcionar bien para temperatura
-            # Para precipitación a veces 'mul' (multiplicativo) es mejor, pero 'add' es más seguro.
             hw_model = ExponentialSmoothing(serie, 
                                             trend='add', 
                                             seasonal='add', 
                                             seasonal_periods=12).fit()
             prediccion = hw_model.forecast(periodos)
             
-            # Holt-Winters no da intervalos de confianza nativos fácilmente,
-            # generamos uno aproximado basado en la desviación estándar histórica.
             std_dev = serie.std()
             conf_int = pd.DataFrame({
                 "lower": prediccion - 1.96 * std_dev,
@@ -85,7 +74,6 @@ def app():
         estado_sel = st.selectbox("1. Estado", lista_estados)
 
     with col2:
-        # Filtrar estaciones por estado
         estaciones_estado = df_estaciones[df_estaciones['ESTADO'] == estado_sel]
         mapa_nombres = dict(zip(estaciones_estado['NOMBRE'], estaciones_estado['ESTACION']))
         nombre_sel = st.selectbox("2. Estación", estaciones_estado['NOMBRE'].unique())
@@ -106,14 +94,12 @@ def app():
 
     # --- 3. PROCESAMIENTO ---
     if st.button("🚀 Generar Pronóstico", type="primary"):
-        # Cargar lecturas
         df_lecturas = utils.cargar_lecturas_por_estado(estado_sel)
         
         if df_lecturas.empty:
             st.warning("No se encontraron lecturas para este estado.")
             return
 
-        # Filtrar por estación específica
         df_filtrado = df_lecturas[df_lecturas["ESTACION"] == id_estacion].copy()
         
         if df_filtrado.empty:
@@ -124,24 +110,21 @@ def app():
         df_filtrado['FECHA'] = pd.to_datetime(df_filtrado['FECHA'])
         df_filtrado = df_filtrado.set_index('FECHA').sort_index()
         
-        # Seleccionar columna y limpiar nulos
+        # --- CORRECCIÓN VITAL: Forzar a numérico ---
         serie_diaria = pd.to_numeric(df_filtrado[col_db], errors='coerce').dropna()
 
         if len(serie_diaria) < 365:
             st.error("⚠️ Datos insuficientes: Se necesitan al menos 1 año de registros para predecir.")
             return
 
-        # --- RESAMPLING (CLAVE PARA CONVERGENCIA) ---
-        # Convertimos datos diarios a mensuales.
-        # Temperatura -> Promedio (mean)
-        # Lluvia/Evap -> Suma (sum)
+        # --- RESAMPLING ---
         regla_resample = 'MS' # Month Start
         if col_db in ["PRECIP", "EVAP"]:
             serie_mensual = serie_diaria.resample(regla_resample).sum()
         else:
             serie_mensual = serie_diaria.resample(regla_resample).mean()
 
-        # Rellenar huecos mensuales si existen (interpolación lineal)
+        # Rellenar huecos
         serie_mensual = serie_mensual.interpolate(method='linear')
 
         # --- 4. MODELADO ---
@@ -156,7 +139,7 @@ def app():
             # --- 5. VISUALIZACIÓN ---
             fig = go.Figure()
 
-            # Datos Históricos (Últimos 5 años para no saturar)
+            # Datos Históricos (Últimos 5 años)
             historia_visible = serie_mensual.tail(60) 
             
             fig.add_trace(go.Scatter(
@@ -176,7 +159,7 @@ def app():
                 line=dict(color='#E63946', width=2.5)
             ))
 
-            # Intervalo de Confianza (Sombra)
+            # Intervalo de Confianza
             fig.add_trace(go.Scatter(
                 x=pd.concat([pd.Series(conf.index), pd.Series(conf.index[::-1])]),
                 y=pd.concat([conf['upper'], conf['lower'][::-1]]),
@@ -196,15 +179,19 @@ def app():
                 legend=dict(orientation="h", y=1.1)
             )
 
-            # Usamos el parámetro nuevo para evitar warnings
             st.plotly_chart(fig, width="stretch")
 
-            # --- 6. METRICAS ---
-            ultimo_valor = historia_visible.iloc[-1]
-            valor_predicho_final = pred.iloc[-1]
-            delta = valor_predicho_final - ultimo_valor
-            
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Último Dato Registrado", f"{ultimo_valor:.1f}")
-            m2.metric(f"Proyección a {meses_pred} meses", f"{valor_predicho_final:.1f}", f"{delta:.1f}")
-            m3.metric("Tendencia Detectada", "📈 Alza" if delta > 0 else "📉 Baja")
+            # --- 6. MÉTRICAS (AQUÍ ESTABA EL ERROR) ---
+            # Forzamos float() para evitar el error de string formatting
+            try:
+                ultimo_valor = float(historia_visible.iloc[-1])
+                valor_predicho_final = float(pred.iloc[-1])
+                delta = valor_predicho_final - ultimo_valor
+                
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Último Dato Registrado", f"{ultimo_valor:.1f}")
+                m2.metric(f"Proyección a {meses_pred} meses", f"{valor_predicho_final:.1f}", f"{delta:.1f}")
+                m3.metric("Tendencia Detectada", "📈 Alza" if delta > 0 else "📉 Baja")
+            except Exception as e:
+                st.warning(f"No se pudieron calcular las métricas finales: {e}")
+
