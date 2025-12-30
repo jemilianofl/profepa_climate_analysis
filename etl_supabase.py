@@ -54,11 +54,24 @@ def normalizar_estado(texto):
         if k in texto: return v
     return None
 
+# Variable global para no saturar la consola
+DEBUG_COUNT = 0 
+
 def procesar_txt(file_path):
+    global DEBUG_COUNT
+    nombre_archivo = os.path.basename(file_path)
+    
     try:
         with open(file_path, 'r', encoding='latin-1') as f:
             encabezado = [next(f) for _ in range(20)]
             head_str = "".join(encabezado)
+            
+            # --- DIAGNÓSTICO: Ver qué está leyendo realmente ---
+            # Solo imprimimos errores detallados para los primeros 5 archivos
+            mostrar_debug = False
+            if DEBUG_COUNT < 5:
+                mostrar_debug = True
+                DEBUG_COUNT += 1
             
             # 1. Metadatos
             est_match = RE_ESTADO.search(head_str)
@@ -67,29 +80,40 @@ def procesar_txt(file_path):
             nom_match = RE_NOMBRE.search(head_str)
 
             if not (est_match and lat_match and lon_match and nom_match): 
-                # print(f"⚠️ Rechazado {os.path.basename(file_path)}: Falta metadata en header")
+                if mostrar_debug:
+                    print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: Falló el REGEX de metadatos.")
+                    print(f"   Cabecera leída:\n{head_str[:100]}...") # Imprime primeros 100 chars
+                    if not est_match: print("   - No encontró ESTADO")
+                    if not lat_match: print("   - No encontró LATITUD")
                 return None, None
 
             estado_raw = est_match.group(1)
             estado = normalizar_estado(estado_raw)
-            lon = float(lon_match.group(1))
             
             # 2. FILTROS DE SEGURIDAD
             if not estado: 
-                # print(f"⚠️ Rechazado {os.path.basename(file_path)}: Estado '{estado_raw}' no reconocido")
+                if mostrar_debug:
+                    print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: Estado '{estado_raw}' no está en la lista permitida.")
                 return None, None
             
-            # Filtro Geográfico (Opcional: Comenta esto si tus datos Mock tienen coordenadas 0.0)
-            # if lon < -94.0: return None, None 
+            lon = float(lon_match.group(1))
+            
+            # --- OJO AQUÍ CON EL FILTRO GEOGRÁFICO ---
+            # Si tus datos son reales de la península, la longitud debe ser aprox -86 a -92.
+            # Si el filtro es "lon < -94", estás pidiendo cosas al OESTE de Tabasco.
+            # Para la península (Yucatán), queremos que sea MAYOR que -94 (más hacia el cero).
+            # Comenta esta línea si tienes dudas:
+            # if lon < -94.0: 
+            #    if mostrar_debug: print(f"❌ [DEBUG] RECHAZADO {nombre_archivo}: Longitud {lon} fuera de rango.")
+            #    return None, None 
 
             info = {
-                # Limpieza extra en el nombre por si el regex agarró basura
                 "NOMBRE": nom_match.group(1).split("ESTADO")[0].strip(),
                 "ESTADO": estado,
                 "LATITUD": float(lat_match.group(1)),
                 "LONGITUD": lon,
-                "ALTITUD": 10.0, # Valor por defecto si no lo leemos
-                "archivo": os.path.basename(file_path)
+                "ALTITUD": 10.0,
+                "archivo": nombre_archivo
             }
 
             # 3. Lectura de Datos
@@ -97,38 +121,51 @@ def procesar_txt(file_path):
             start_line = 0
             found_data = False
             for i, line in enumerate(encabezado):
-                if "FECHA" in line and "PRECIP" in line: # Búsqueda más flexible
+                # Búsqueda más flexible (a veces es "FECHA" y "PRECIP", a veces solo "FECHA")
+                if "FECHA" in line: 
                     start_line = i
                     found_data = True
                     break
             
             if not found_data: 
+                if mostrar_debug: print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: No encontró la línea 'FECHA'.")
                 return None, None
 
-            df = pd.read_csv(
-                f, sep=r'\s+', skiprows=start_line + 2,
-                names=["FECHA", "PRECIP", "EVAP", "TMAX", "TMIN"],
-                encoding='latin-1', engine='python', dtype=str
-            )
+            # Intentamos leer con pandas
+            try:
+                df = pd.read_csv(
+                    f, sep=r'\s+', skiprows=start_line + 2,
+                    names=["FECHA", "PRECIP", "EVAP", "TMAX", "TMIN"],
+                    encoding='latin-1', engine='python', dtype=str
+                )
+            except Exception as e:
+                if mostrar_debug: print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: Error leyendo CSV pandas: {e}")
+                return None, None
 
-            # 4. Limpieza
-            df["ESTACION"] = info["NOMBRE"] # Enlace clave con la tabla padre
-            df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce')
+            # 4. Limpieza y Conversión
+            df["ESTACION"] = info["NOMBRE"]
+            df['FECHA'] = pd.to_datetime(df['FECHA'], dayfirst=True, errors='coerce') # dayfirst=True ayuda con DD/MM/YYYY
+            
+            # Checar si la conversión de fechas falló masivamente
+            if df['FECHA'].notna().sum() == 0:
+                 if mostrar_debug: print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: Todas las fechas son NaT (formato de fecha incorrecto).")
+                 return None, None
+
             df = df.drop_duplicates(subset=['FECHA'], keep='last')
-            
-            for c in ["PRECIP", "EVAP", "TMAX", "TMIN"]:
-                df[c] = pd.to_numeric(df[c].replace("NULO", None), errors='coerce')
-            
             df = df.dropna(subset=['FECHA'])
+            
+            # Filtro de año
             df = df[df['FECHA'].dt.year >= 2000]
 
             if df.empty: 
-                return info, None # Retornamos info aunque no haya lecturas, para poblar estaciones
+                if mostrar_debug: print(f"\n❌ [DEBUG] RECHAZADO {nombre_archivo}: DataFrame vacío después de filtrar por año >= 2000.")
+                # AUNQUE NO TENGA LECTURAS, RETORNAMOS INFO PARA GUARDAR LA ESTACIÓN
+                return info, None 
             
             return info, df
 
     except Exception as e:
-        # print(f"Error procesando {file_path}: {e}")
+        print(f"Error fatal procesando {file_path}: {e}")
         return None, None
 
 def subir_lote(engine, metas, dfs):
