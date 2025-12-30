@@ -7,6 +7,18 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import time
 from dotenv import load_dotenv
+import socket
+
+# --- PARCHE PARA GITHUB ACTIONS (FORZAR IPv4) ---
+# GitHub Actions a veces intenta usar IPv6 para conectar a Supabase y falla.
+# Esto obliga a usar IPv4.
+old_getaddrinfo = socket.getaddrinfo
+def new_getaddrinfo(*args, **kwargs):
+    res = old_getaddrinfo(*args, **kwargs)
+    # Filtrar solo resultados familia AF_INET (IPv4)
+    return [r for r in res if r[0] == socket.AF_INET]
+socket.getaddrinfo = new_getaddrinfo
+# ------------------------------------------------
 
 load_dotenv()
 
@@ -29,6 +41,8 @@ RE_NOMBRE = re.compile(r"NOMBRE\s*:\s*(.+)")
 
 def conectar_db():
     if not DB_URI:
+        # Imprimir parte del error para depurar si está vacío en Actions
+        print("ERROR: La variable DB_CONNECTION_STRING está vacía.")
         raise ValueError("No se encontró DB_CONNECTION_STRING")
     return create_engine(DB_URI)
 
@@ -58,7 +72,7 @@ def procesar_txt(file_path):
             
             # 2. FILTROS DE SEGURIDAD
             if not estado: return None, None
-            # Filtro Geográfico: Si está al oeste de -94, NO es la península (es Michoacán/Jalisco infiltrado)
+            # Filtro Geográfico: Si está al oeste de -94, NO es la península
             if lon < -94.0: return None, None 
 
             info = {
@@ -103,23 +117,49 @@ def procesar_txt(file_path):
 
 def subir_lote(engine, metas, dfs):
     if not metas: return
-    with engine.begin() as conn:
-        pd.DataFrame(metas).to_sql("estaciones", conn, if_exists='append', index=False, method='multi')
-        pd.concat(dfs).to_sql("lecturas", conn, if_exists='append', index=False, chunksize=500, method='multi')
+    try:
+        with engine.begin() as conn:
+            pd.DataFrame(metas).to_sql("estaciones", conn, if_exists='append', index=False, method='multi')
+            pd.concat(dfs).to_sql("lecturas", conn, if_exists='append', index=False, chunksize=500, method='multi')
+    except Exception as e:
+        print(f"Error subiendo lote: {e}")
 
 def main():
     print("🚀 Iniciando Actualización Automática...")
-    engine = conectar_db()
     
+    # Intento de conexión con reintento simple
+    try:
+        engine = conectar_db()
+        # Probar conexión simple antes de procesar
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("✅ Conexión a Base de Datos Exitosa (IPv4).")
+    except Exception as e:
+        print(f"❌ Error fatal conectando a la BD: {e}")
+        return
+
     # IMPORTANTE: DROP para reiniciar tablas limpias cada vez
-    with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS lecturas CASCADE;"))
-        conn.execute(text("DROP TABLE IF EXISTS estaciones CASCADE;"))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS lecturas CASCADE;"))
+            conn.execute(text("DROP TABLE IF EXISTS estaciones CASCADE;"))
+    except Exception as e:
+        print(f"⚠️ Advertencia al reiniciar tablas: {e}")
 
     carpetas = ["CAMP", "YUC", "QROO"]
     files = []
+    # Verifica que existan carpetas, si no, busca recursivo para evitar fallos si cambia la estructura
     for c in carpetas:
-        files.extend(glob.glob(os.path.join(DATA_FOLDER, c, "*.txt")))
+        path = os.path.join(DATA_FOLDER, c, "*.txt")
+        encontrados = glob.glob(path)
+        if not encontrados:
+            print(f"⚠️ No se encontraron archivos en {path}, intentando búsqueda recursiva...")
+            files.extend(glob.glob(os.path.join(DATA_FOLDER, "**/*.txt"), recursive=True))
+            break
+        files.extend(encontrados)
+    
+    # Eliminar duplicados de archivos si la búsqueda recursiva se activó
+    files = list(set(files))
     
     print(f"📂 Procesando {len(files)} archivos...")
     
@@ -135,10 +175,10 @@ def main():
                     
     if batch_m: subir_lote(engine, batch_m, batch_d)
     
-    # Índices finales
+    print("🔧 Creando índices...")
     with engine.begin() as conn:
-        conn.execute(text('CREATE INDEX idx_est ON estaciones ("ESTADO");'))
-        conn.execute(text('CREATE INDEX idx_lec ON lecturas ("ESTACION", "FECHA");'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_est ON estaciones ("ESTADO");'))
+        conn.execute(text('CREATE INDEX IF NOT EXISTS idx_lec ON lecturas ("ESTACION", "FECHA");'))
         
     print("🏁 Actualización Completada.")
 
